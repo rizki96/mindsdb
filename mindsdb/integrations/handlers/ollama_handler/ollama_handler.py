@@ -34,11 +34,12 @@ class OllamaHandler(BaseMLEngine):
         args = args['using']
         args['target'] = target
         connection = args.get('ollama_serve_url', OllamaHandler.DEFAULT_SERVE_URL)
+        # print(args)
 
         def _model_check():
             """ Checks model has been pulled and that it works correctly. """
             responses = {}
-            for endpoint in ['generate', 'embeddings']:
+            for endpoint in ['chat', 'generate', 'embeddings']:
                 try:
                     code = requests.post(
                         connection + f'/api/{endpoint}',
@@ -79,7 +80,8 @@ class OllamaHandler(BaseMLEngine):
             if len(runnable_modes) == 1:
                 args['mode'] = runnable_modes[0]
             else:
-                args['mode'] = 'generate'
+                # args['mode'] = 'generate'
+                args['mode'] = 'chat'
 
         self.model_storage.json_set('args', args)
 
@@ -93,30 +95,45 @@ class OllamaHandler(BaseMLEngine):
                 pd.DataFrame: The DataFrame containing row-wise text completions.
         """
         # setup
+        pd.set_option('display.max_colwidth', None)
         pred_args = args.get('predict_params', {})
         args = self.model_storage.json_get('args')
         model_name, target_col = args['model_name'], args['target']
         prompt_template = pred_args.get('prompt_template',
                                         args.get('prompt_template', 'Answer the following question: {{{{text}}}}'))
+        system_prompt = args.get('prompt', "")
+
+        # json struct
+        struct = args.get('json_struct', '{}')
+        json_struct = json.loads(struct)
 
         # prepare prompts
         prompts, empty_prompt_ids = get_completed_prompts(prompt_template, df)
         df['__mdb_prompt'] = prompts
-
+        print(df, system_prompt)
+        
         # setup endpoint
         endpoint = args.get('mode', 'generate')
 
         # call llm
+        json_data = lambda r: {
+            'model': model_name,
+            'messages': [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': r['__mdb_prompt']}
+            ],
+            'tools': [json_struct],
+        } if endpoint == 'chat' else lambda r: {
+            'model': model_name,
+            'prompt': r['__mdb_prompt'],
+        }
         completions = []
         for i, row in df.iterrows():
             if i not in empty_prompt_ids:
                 connection = args.get('ollama_serve_url', OllamaHandler.DEFAULT_SERVE_URL)
                 raw_output = requests.post(
                     connection + f'/api/{endpoint}',
-                    json={
-                        'model': model_name,
-                        'prompt': row['__mdb_prompt'],
-                    }
+                    json=json_data(row)
                 )
                 lines = raw_output.content.decode().split('\n')  # stream of output tokens
 
@@ -130,8 +147,11 @@ class OllamaHandler(BaseMLEngine):
                         elif 'embedding' in info:
                             embedding = info['embedding']
                             values.append(embedding)
+                        elif 'message' in info and 'tool_calls' in info['message']:
+                            tool = info['message']['tool_calls']
+                            values.append(tool)
 
-                if endpoint == 'embeddings':
+                if endpoint == 'embeddings' or endpoint == 'chat':
                     completions.append(values)
                 else:
                     completions.append(''.join(values))
